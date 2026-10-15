@@ -1,0 +1,111 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+- name: Validate static deployment inputs
+  ansible.builtin.assert:
+    that:
+      - apisix_pg_mode in ['sync', 'serve']
+      - apisix_pg_gateway is match('^[a-zA-Z0-9_.-]+$')
+      - apisix_pg_root is match('^/[a-zA-Z0-9/_.-]+$')
+      - apisix_pg_home is match('^/[a-zA-Z0-9/_.-]+$')
+
+- name: Require preinstalled APISIX and runtime environment
+  ansible.builtin.stat:
+    path: '{{ item }}'
+  loop:
+    - '{{ apisix_pg_binary }}'
+    - '{{ apisix_pg_environment_file }}'
+  register: apisix_pg_prerequisites
+
+- name: Reject missing bootstrap prerequisites
+  ansible.builtin.assert:
+    that: item.stat.exists
+  loop: '{{ apisix_pg_prerequisites.results }}'
+  loop_control:
+    label: '{{ item.item }}'
+
+- name: Create synchronizer directories
+  ansible.builtin.file:
+    path: '{{ item }}'
+    state: directory
+    owner: '{{ apisix_pg_user }}'
+    group: '{{ apisix_pg_group }}'
+    mode: '0750'
+  loop:
+    - '{{ apisix_pg_root }}'
+    - '{{ apisix_pg_state | dirname }}'
+
+- name: Install synchronizer and validator from the pinned fork checkout
+  ansible.builtin.copy:
+    src: '{{ role_path }}/../../../{{ item }}'
+    dest: '{{ apisix_pg_root }}/{{ item }}'
+    owner: '{{ apisix_pg_user }}'
+    group: '{{ apisix_pg_group }}'
+    mode: '{{ "0750" if item.endswith(".sh") else "0640" }}'
+  loop:
+    - gateway_config.py
+    - validate.lua
+    - validate-native.sh
+    - requirements.txt
+    - schema.sql
+  register: apisix_pg_code
+
+- name: Install Python runtime dependencies
+  ansible.builtin.pip:
+    requirements: '{{ apisix_pg_root }}/requirements.txt'
+    virtualenv: '{{ apisix_pg_root }}/venv'
+    virtualenv_command: '{{ apisix_pg_python }} -m venv'
+
+- name: Deploy etcd-free static APISIX bootstrap
+  ansible.builtin.copy:
+    src: '{{ role_path }}/../../../config.yaml'
+    dest: '{{ apisix_pg_home }}/conf/config.yaml'
+    mode: '0640'
+    backup: true
+  register: apisix_pg_bootstrap
+
+- name: Seed deny-all dynamic configuration only on first deployment
+  ansible.builtin.copy:
+    src: '{{ role_path }}/../../../empty-apisix.yaml'
+    dest: '{{ apisix_pg_home }}/conf/apisix.yaml'
+    owner: '{{ apisix_pg_user }}'
+    group: '{{ apisix_pg_group }}'
+    mode: '0640'
+    force: false
+
+- name: Check native APISIX bootstrap
+  ansible.builtin.command:
+    argv: ['{{ apisix_pg_binary }}', test]
+    chdir: '{{ apisix_pg_home }}'
+  changed_when: false
+
+- name: Apply static bootstrap only when changed
+  ansible.builtin.systemd:
+    name: '{{ apisix_pg_apisix_service }}'
+    state: restarted
+  when: apisix_pg_bootstrap.changed
+
+- name: Install synchronizer service
+  ansible.builtin.template:
+    src: apisix-pg-config.service.j2
+    dest: /etc/systemd/system/apisix-pg-config.service
+    mode: '0644'
+  register: apisix_pg_service
+
+- name: Start or update configuration service
+  ansible.builtin.systemd:
+    name: apisix-pg-config.service
+    daemon_reload: true
+    enabled: true
+    state: '{{ "restarted" if (apisix_pg_service.changed or apisix_pg_code.changed or apisix_pg_bootstrap.changed) else "started" }}'
